@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Collection, List, Literal, Optional, Tuple, TypeVar
 
 Binding = Literal["left", "right"]
@@ -322,6 +323,249 @@ def locate_defects(
         "paper_height_mm": paper_height,
         "defect_count": len(results),
         "defects": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 墨区着墨面积（ink-zones）：页内矩形随页位映射到纸面，按等宽墨区汇总
+# ---------------------------------------------------------------------------
+
+# 墨区数量允许范围
+INK_ZONE_MIN_COUNT = 1
+INK_ZONE_MAX_COUNT = 16
+
+# CMYK 四通道顺序
+INK_CHANNELS: Tuple[str, str, str, str] = ("cyan", "magenta", "yellow", "black")
+
+# 页内矩形：(左上角 x, 左上角 y, 宽, 高, 青, 品, 黄, 黑覆盖率)，
+# 坐标以页面左上角为原点（x 向右、y 向下，单位 mm），覆盖率 ∈ [0, 1]
+PageRect = Tuple[float, float, float, float, float, float, float, float]
+
+# 单页墨稿：(页码, [页内矩形, ...])
+PageInk = Tuple[int, List[PageRect]]
+
+
+def _rects_overlap(
+    a: PageRect, b: PageRect, eps: float = 1e-9
+) -> bool:
+    """两个页内矩形（左上原点、x/y/宽/高）是否有正面积交叠。
+
+    边相切（交叠面积为 0）不算重叠；``eps`` 为相对尺度的容差，用于抵消浮点误差。
+    """
+    ax, ay, aw, ah = a[:4]
+    bx, by, bw, bh = b[:4]
+    tolerance = eps * max(1.0, ax + aw, ay + ah, bx + bw, by + bh)
+    return (
+        ax < bx + bw - tolerance
+        and bx < ax + aw - tolerance
+        and ay < by + bh - tolerance
+        and by < ay + ah - tolerance
+    )
+
+
+def ink_zones(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width_mm: float,
+    page_height_mm: float,
+    gutter_mm: float,
+    duplex_flip: DuplexFlip,
+    zone_count: int,
+    copies: int,
+    page_inks: List[PageInk],
+) -> dict:
+    """按等宽墨区统计各通道等效着墨面积（已乘印数）。
+
+    页序、分帖、槽位与旋转规则完全沿用 :func:`press_layout`。每个页内矩形
+    （以页面左上角为原点）先按所在页位的 ``rotation_deg`` 映射到纸面坐标：
+
+    - 0°：纸面左上角 = 槽位左上角 + 矩形左上角，宽高不变；
+    - 180°：绕页位中心旋转，纸面左上角 =
+      ``(槽位 x + 页宽 − x − w, 槽位 y + 页高 − y − h)``，宽高不变。
+
+    纸面按宽度等分为 ``zone_count`` 个墨区（1～16），矩形与墨区按交叠面积
+    拆分；某通道在某墨区的等效着墨面积为
+    ``Σ 交叠面积 × 该矩形该通道覆盖率``，再乘印数 ``copies``（正整数）。
+
+    按帖、张、正反面与墨区返回结果；空白页位（末帖补白）不参与统计，
+    任何通道均为 0 的墨区也不输出（矩形落在中缝内的部分同理为 0）。
+
+    以下情况抛 ``ValueError``（API 层对应 422）：墨区数量不在 1～16、
+    印数不是正整数、页码无效（非正或超过总页数）、同页出现两次、
+    页内矩形坐标/宽高为非有限值或越出页面（允许贴边）、同页矩形正面积重叠、
+    通道覆盖率不在 [0, 1]。
+    """
+    if not isinstance(zone_count, int) or isinstance(zone_count, bool) or not (
+        INK_ZONE_MIN_COUNT <= zone_count <= INK_ZONE_MAX_COUNT
+    ):
+        raise ValueError(
+            f"墨区数量必须为 {INK_ZONE_MIN_COUNT}～{INK_ZONE_MAX_COUNT} 的整数"
+        )
+    if (
+        not isinstance(copies, int)
+        or isinstance(copies, bool)
+        or copies < 1
+    ):
+        raise ValueError("印数 copies 必须为正整数")
+
+    inks_by_page: dict = {}
+    for page_index, (page, rects) in enumerate(page_inks, start=1):
+        if not isinstance(page, int) or isinstance(page, bool) or not (
+            1 <= page <= total_pages
+        ):
+            raise ValueError(
+                f"第 {page_index} 组页内矩形的页码 {page!r} 无效："
+                f"总页数为 {total_pages}，页码须在 1～{total_pages} 之间"
+            )
+        if page in inks_by_page:
+            raise ValueError(f"第 {page} 页的页内矩形重复给出，每页只能出现一次")
+        if not rects:
+            raise ValueError(f"第 {page} 页至少需要给出 1 个页内矩形")
+        scale = max(1.0, page_width_mm, page_height_mm)
+        tolerance = 1e-9 * scale
+        validated: List[PageRect] = []
+        for rect_index, rect in enumerate(rects, start=1):
+            if len(rect) != 8:
+                raise ValueError(f"第 {page} 页第 {rect_index} 个矩形字段不完整")
+            rx, ry, rw, rh, c, m, y_value, k = rect
+            values = (rx, ry, rw, rh, c, m, y_value, k)
+            if not all(math.isfinite(v) for v in values):
+                raise ValueError(
+                    f"第 {page} 页第 {rect_index} 个矩形含非有限数值"
+                    "（NaN / Infinity）"
+                )
+            if rx < -tolerance or ry < -tolerance:
+                raise ValueError(
+                    f"第 {page} 页第 {rect_index} 个矩形越出页面："
+                    f"左上角 ({rx}, {ry}) 不能为负"
+                )
+            if rw <= 0 or rh <= 0:
+                raise ValueError(
+                    f"第 {page} 页第 {rect_index} 个矩形越界：宽、高必须为正数"
+                )
+            if rx + rw > page_width_mm + tolerance or (
+                ry + rh > page_height_mm + tolerance
+            ):
+                raise ValueError(
+                    f"第 {page} 页第 {rect_index} 个矩形越出页面："
+                    f"矩形 ({rx}, {ry}, {rw}, {rh}) 须完整落在 "
+                    f"{page_width_mm} × {page_height_mm}（mm）的页面内"
+                )
+            # 夹回边界，消除贴边时的浮点误差
+            rx = max(0.0, min(rx, page_width_mm))
+            ry = max(0.0, min(ry, page_height_mm))
+            rw = min(rw, page_width_mm - rx)
+            rh = min(rh, page_height_mm - ry)
+            for channel, coverage in zip(INK_CHANNELS, (c, m, y_value, k)):
+                if not 0.0 <= coverage <= 1.0:
+                    raise ValueError(
+                        f"第 {page} 页第 {rect_index} 个矩形的 {channel} 通道"
+                        f"覆盖率 {coverage} 越界，须在 0～1 之间"
+                    )
+            for other in validated:
+                if _rects_overlap(other, (rx, ry, rw, rh, c, m, y_value, k)):
+                    raise ValueError(
+                        f"第 {page} 页的页内矩形互不重叠：第 {rect_index} 个矩形"
+                        f" ({rx}, {ry}, {rw}, {rh}) 与此前矩形正面积交叠"
+                    )
+            validated.append((rx, ry, rw, rh, c, m, y_value, k))
+        inks_by_page[page] = validated
+
+    layout = press_layout(
+        total_pages,
+        max_sheets,
+        binding,
+        page_width_mm,
+        page_height_mm,
+        gutter_mm,
+        duplex_flip,
+    )
+    paper_width = layout["paper_width_mm"]
+    paper_height = layout["paper_height_mm"]
+    zone_width = paper_width / zone_count
+
+    result_signatures: List[dict] = []
+    for signature in layout["signatures"]:
+        result_sheets: List[dict] = []
+        for sheet in signature["sheets"]:
+            sides: dict = {}
+            for side in ("front", "back"):
+                # totals[墨区索引] = [青, 品, 黄, 黑] 累计等效面积（未乘印数）
+                totals = [[0.0, 0.0, 0.0, 0.0] for _ in range(zone_count)]
+                for slot in ("left", "right"):
+                    placement = sheet[side][slot]
+                    if placement is None:
+                        continue  # 空白页位（末帖补白）不计
+                    rects = inks_by_page.get(placement["page"])
+                    if not rects:
+                        continue
+                    slot_x = placement["x_mm"]
+                    for rx, ry, rw, rh, c, m, y_value, k in rects:
+                        if placement["rotation_deg"] == 180:
+                            px = slot_x + page_width_mm - rx - rw
+                            py = page_height_mm - ry - rh
+                        else:
+                            px = slot_x + rx
+                            py = ry
+                        first = max(0, int(math.floor(px / zone_width)))
+                        last = min(
+                            zone_count - 1,
+                            int(math.floor((px + rw) / zone_width)),
+                        )
+                        for zone_index in range(first, last + 1):
+                            overlap_w = (
+                                min(px + rw, (zone_index + 1) * zone_width)
+                                - max(px, zone_index * zone_width)
+                            )
+                            if overlap_w <= 0.0:
+                                continue
+                            area = overlap_w * rh
+                            totals[zone_index][0] += area * c
+                            totals[zone_index][1] += area * m
+                            totals[zone_index][2] += area * y_value
+                            totals[zone_index][3] += area * k
+                zones = []
+                for zone_index, channel_totals in enumerate(totals):
+                    if any(value > 0.0 for value in channel_totals):
+                        zones.append(
+                            {
+                                "zone_index": zone_index + 1,
+                                "cyan_mm2": channel_totals[0] * copies,
+                                "magenta_mm2": channel_totals[1] * copies,
+                                "yellow_mm2": channel_totals[2] * copies,
+                                "black_mm2": channel_totals[3] * copies,
+                            }
+                        )
+                if zones:
+                    sides[side] = zones
+            result_sheets.append(
+                {"sheet_index": sheet["sheet_index"], **sides}
+            )
+        result_signatures.append(
+            {
+                "signature_index": signature["signature_index"],
+                "sheet_count": signature["sheet_count"],
+                "page_count_padded": signature["page_count_padded"],
+                "sheets": result_sheets,
+            }
+        )
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_width_mm": page_width_mm,
+        "page_height_mm": page_height_mm,
+        "gutter_mm": gutter_mm,
+        "duplex_flip": duplex_flip,
+        "paper_width_mm": paper_width,
+        "paper_height_mm": paper_height,
+        "zone_count": zone_count,
+        "zone_width_mm": zone_width,
+        "copies": copies,
+        "signature_count": len(result_signatures),
+        "signatures": result_signatures,
     }
 
 

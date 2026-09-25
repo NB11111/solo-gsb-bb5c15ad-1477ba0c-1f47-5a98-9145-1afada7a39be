@@ -1338,3 +1338,315 @@ def test_locate_defects_missing_field_returns_422():
     }
     response = client.post("/api/v1/impose/locate-defects", json=body)
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 墨区着墨面积 /api/v1/impose/ink-zones
+# ---------------------------------------------------------------------------
+
+INK_ZONES_BASE = {
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 100.0,
+    "page_height_mm": 100.0,
+    "gutter_mm": 0.0,
+    "duplex_flip": "long",
+    "zone_count": 4,
+    "copies": 1,
+    "page_inks": [],
+}
+
+
+def test_ink_zones_front_and_back_placements():
+    body = {
+        **INK_ZONES_BASE,
+        "copies": 1000,
+        "page_inks": [
+            # 第 1 页：正面右槽 x=100；页内 (50,10,25,40) C=.5
+            # -> 纸面 150..175 落区 4，1000×.5×1000 = 500000
+            {"page": 1, "rectangles": [
+                {"x_mm": 50, "y_mm": 10, "width_mm": 25, "height_mm": 40,
+                 "cyan": 0.5, "magenta": 0, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 200.0
+    assert data["zone_count"] == 4
+    assert data["zone_width_mm"] == 50.0
+    assert data["copies"] == 1000
+    sheet = data["signatures"][0]["sheets"][0]
+    assert sheet["front"] == [
+        {"zone_index": 4, "cyan_mm2": 500000.0, "magenta_mm2": 0.0,
+         "yellow_mm2": 0.0, "black_mm2": 0.0},
+    ]
+    # 无着墨的背面整面缺省
+    assert "back" not in sheet
+
+
+def test_ink_zones_split_across_boundaries():
+    # 纸面 220（中缝 20）、4 墨区每区 55；第 4 页正面左槽 x=0
+    body = {
+        **INK_ZONES_BASE,
+        "gutter_mm": 20.0,
+        "copies": 4,
+        "page_inks": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 40, "y_mm": 0, "width_mm": 40, "height_mm": 100,
+                 "cyan": 0, "magenta": 0, "yellow": 0, "black": 0.25},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 200
+    front = response.json()["signatures"][0]["sheets"][0]["front"]
+    assert front == [
+        {"zone_index": 1, "cyan_mm2": 0.0, "magenta_mm2": 0.0,
+         "yellow_mm2": 0.0, "black_mm2": 1500.0},
+        {"zone_index": 2, "cyan_mm2": 0.0, "magenta_mm2": 0.0,
+         "yellow_mm2": 0.0, "black_mm2": 2500.0},
+    ]
+
+
+def test_ink_zones_short_flip_back_rotated_180():
+    body = {
+        **INK_ZONES_BASE,
+        "duplex_flip": "short",
+        "zone_count": 2,
+        "copies": 2,
+        "page_inks": [
+            # short 背面背左 = 第 2 页（x=0）旋转 180：
+            # 页内 (40,10,20,20) -> 纸面 40..60 落区 1，400×1×2 = 800
+            {"page": 2, "rectangles": [
+                {"x_mm": 40, "y_mm": 10, "width_mm": 20, "height_mm": 20,
+                 "cyan": 0, "magenta": 1, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 200
+    back = response.json()["signatures"][0]["sheets"][0]["back"]
+    assert back == [
+        {"zone_index": 1, "cyan_mm2": 0.0, "magenta_mm2": 800.0,
+         "yellow_mm2": 0.0, "black_mm2": 0.0},
+    ]
+
+
+def test_ink_zones_blank_pages_not_counted():
+    # 1 页补 3 空白：正面 (null,1)、背面 (null,null)
+    body = {
+        **INK_ZONES_BASE,
+        "total_pages": 1,
+        "page_inks": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 50, "height_mm": 50,
+                 "cyan": 0.5, "magenta": 0, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 200
+    sheet = response.json()["signatures"][0]["sheets"][0]
+    assert "back" not in sheet
+    assert sheet["front"][0]["zone_index"] == 3
+    assert sheet["front"][0]["cyan_mm2"] == 1250.0
+
+
+def test_ink_zones_empty_page_inks_ok():
+    response = client.post("/api/v1/impose/ink-zones", json=INK_ZONES_BASE)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["signatures"][0]["sheets"][0] == {"sheet_index": 1}
+
+
+def test_ink_zones_touching_rectangles_allowed():
+    body = {
+        **INK_ZONES_BASE,
+        "page_inks": [
+            {"page": 4, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 50, "height_mm": 50,
+                 "cyan": 0, "magenta": 0, "yellow": 0, "black": 0.5},
+                {"x_mm": 50, "y_mm": 0, "width_mm": 50, "height_mm": 50,
+                 "cyan": 0, "magenta": 0.3, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 200
+
+
+def test_ink_zones_invalid_zone_count():
+    for zone_count in (0, 17):
+        response = client.post(
+            "/api/v1/impose/ink-zones",
+            json={**INK_ZONES_BASE, "zone_count": zone_count},
+        )
+        assert response.status_code == 422
+
+
+def test_ink_zones_integer_fields_reject_bool_and_float():
+    for override in (
+        {"zone_count": True},
+        {"zone_count": 1.5},
+        {"copies": True},
+        {"copies": 2.0},
+    ):
+        response = client.post(
+            "/api/v1/impose/ink-zones",
+            json={**INK_ZONES_BASE, **override},
+        )
+        assert response.status_code == 422
+    response = client.post(
+        "/api/v1/impose/ink-zones",
+        json={**INK_ZONES_BASE, "page_inks": [
+            {"page": True, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 1, "height_mm": 1,
+                 "cyan": 0, "magenta": 0, "yellow": 0, "black": 0}]}]},
+    )
+    assert response.status_code == 422
+
+
+def test_ink_zones_invalid_copies():
+    for copies in (0, -1):
+        response = client.post(
+            "/api/v1/impose/ink-zones",
+            json={**INK_ZONES_BASE, "copies": copies},
+        )
+        assert response.status_code == 422
+
+
+def test_ink_zones_invalid_page_number():
+    body = {
+        **INK_ZONES_BASE,
+        "page_inks": [
+            {"page": 5, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10,
+                 "cyan": 0, "magenta": 0, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 422
+
+
+def test_ink_zones_duplicate_page_returns_422():
+    rect = {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10,
+            "cyan": 0, "magenta": 0, "yellow": 0, "black": 0}
+    body = {
+        **INK_ZONES_BASE,
+        "page_inks": [{"page": 1, "rectangles": [rect]},
+                      {"page": 1, "rectangles": [rect]}],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 422
+
+
+def test_ink_zones_rect_out_of_page_returns_422():
+    for rect in (
+        {"x_mm": -1, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 0, "width_mm": 101, "height_mm": 10},
+        {"x_mm": 95, "y_mm": 0, "width_mm": 10, "height_mm": 10},
+        {"x_mm": 0, "y_mm": 0, "width_mm": 0, "height_mm": 10},
+    ):
+        rect = {**rect, "cyan": 0, "magenta": 0, "yellow": 0, "black": 0}
+        body = {
+            **INK_ZONES_BASE,
+            "page_inks": [{"page": 1, "rectangles": [rect]}],
+        }
+        response = client.post("/api/v1/impose/ink-zones", json=body)
+        assert response.status_code == 422
+
+
+def test_ink_zones_overlapping_rectangles_return_422():
+    body = {
+        **INK_ZONES_BASE,
+        "page_inks": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 50, "height_mm": 50,
+                 "cyan": 0, "magenta": 0, "yellow": 0, "black": 0},
+                {"x_mm": 40, "y_mm": 40, "width_mm": 20, "height_mm": 20,
+                 "cyan": 0, "magenta": 0, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 422
+
+
+def test_ink_zones_coverage_out_of_range_returns_422():
+    body = {
+        **INK_ZONES_BASE,
+        "page_inks": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10,
+                 "cyan": 1.01, "magenta": 0, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 422
+    body["page_inks"][0]["rectangles"][0]["cyan"] = -0.1
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 422
+
+
+def test_ink_zones_non_finite_rect_returns_422():
+    payload = (
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": 100, "page_height_mm": 100, "gutter_mm": 0, '
+        '"duplex_flip": "long", "zone_count": 4, "copies": 1, "page_inks": '
+        '[{"page": 1, "rectangles": [{"x_mm": NaN, "y_mm": 0, '
+        '"width_mm": 10, "height_mm": 10, "cyan": 0, "magenta": 0, '
+        '"yellow": 0, "black": 0}]}]}'
+    )
+    response = client.post(
+        "/api/v1/impose/ink-zones",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_ink_zones_layout_validation_reused():
+    rect = {"x_mm": 0, "y_mm": 0, "width_mm": 10, "height_mm": 10,
+            "cyan": 0, "magenta": 0, "yellow": 0, "black": 0}
+    for override in (
+        {"page_width_mm": 0},
+        {"page_height_mm": -1},
+        {"gutter_mm": -0.5},
+        {"duplex_flip": "side"},
+        {"binding": "top"},
+        {"total_pages": 0},
+    ):
+        response = client.post(
+            "/api/v1/impose/ink-zones",
+            json={**INK_ZONES_BASE, **override,
+                  "page_inks": [{"page": 1, "rectangles": [rect]}]},
+        )
+        assert response.status_code == 422
+    response = client.post(
+        "/api/v1/impose/ink-zones",
+        json={**INK_ZONES_BASE, "extra": 1},
+    )
+    assert response.status_code == 422
+
+
+def test_ink_zones_missing_field_returns_422():
+    body = dict(INK_ZONES_BASE)
+    del body["zone_count"]
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 422
+    body = {
+        **INK_ZONES_BASE,
+        "page_inks": [
+            {"page": 1, "rectangles": [
+                {"x_mm": 0, "y_mm": 0, "width_mm": 10,
+                 "cyan": 0, "magenta": 0, "yellow": 0, "black": 0},
+            ]},
+        ],
+    }
+    response = client.post("/api/v1/impose/ink-zones", json=body)
+    assert response.status_code == 422
