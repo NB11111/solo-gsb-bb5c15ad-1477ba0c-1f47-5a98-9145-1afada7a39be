@@ -25,6 +25,10 @@
 `proof.pdf`——每张印张依次生成正面、背面两页，纸面尺寸与机台版面一致，各页位标注页码、帖号与张号，
 空白位标注“空白”，并画出中缝分隔线；长边 / 短边翻转的背面分别按槽位交换、旋转 180° 呈现。
 
+还提供**墨区着墨面积**接口 `/api/v1/impose/ink-zones`：沿用机台版面的全部参数、分帖与页位坐标规则，
+另给等宽墨区数量（1～16）、正整数印数与各页互不重叠的页内矩形及 CMYK 覆盖率（0～1）；矩形随页位
+0°/180° 方向映射到纸面后按墨区交叠面积拆分，按帖、张、正反面和墨区返回各通道等效着墨面积乘印数的结果。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -67,6 +71,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 印张抽检接口：`POST http://localhost:8000/api/v1/impose/inspect`
 - 机台版面接口：`POST http://localhost:8000/api/v1/impose/press-layout`
 - 瑕疵定位接口：`POST http://localhost:8000/api/v1/impose/locate-defects`
+- 墨区着墨面积接口：`POST http://localhost:8000/api/v1/impose/ink-zones`
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 
 ## 接口说明
@@ -343,6 +348,144 @@ curl -X POST http://localhost:8000/api/v1/impose/locate-defects \
 瑕疵点缺字段或含未定义字段、`side` 不是 `front`/`back`、坐标为非有限值（`NaN` /
 `Infinity`）、**坐标越出纸面**（含负坐标）、**帖号或张号无效**（小于 1 或超出实际
 帖数/张数）时，均返回 `422 Unprocessable Entity`。
+
+## 墨区着墨面积（POST /api/v1/impose/ink-zones）
+
+在机台版面的**相同分帖、页序、槽位与旋转规则**之上，把各页给出的页内着墨矩形随页位
+映射到纸面，沿纸面宽度方向按**等宽墨区**拆分，计算每个墨区 CMYK 各通道的**等效着墨
+面积**（单位 mm²，单面一次过墨）并乘印数，供印刷机墨键预设使用。本地访问地址
+`http://localhost:8000/api/v1/impose/ink-zones`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/ink-zones`，`Content-Type: application/json`
+
+机台版面的全部参数原样沿用（`total_pages` / `max_sheets_per_signature` / `binding` /
+`page_width_mm` / `page_height_mm` / `gutter_mm` / `duplex_flip`，约束相同），另加：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `ink_zone_count` | 整数 | 1～16 | 沿纸面宽度方向等宽切分的墨区数量 |
+| `print_run` | 整数 | ≥ 1（正整数） | 印数；结果按印数倍增 |
+| `pages` | 对象数组 | 允许为空数组 | 各页的页内矩形；每页至多一项、页码不重复 |
+| `pages[].page` | 整数 | 1～`total_pages` | 页码（空白页无需给出，给出空矩形也不计） |
+| `pages[].rectangles` | 矩形数组 | 同页矩形**互不重叠**（边缘相切允许） | 页内矩形列表，可为空数组 |
+| `rectangles[].x_mm` / `y_mm` | 数值 | 有限值，非负 | 矩形**左上角**在页内的坐标（mm），以页面（阅读方向）左上角为原点，x 向右、y 向下 |
+| `rectangles[].width_mm` / `height_mm` | 数值 | 正数（有限值） | 矩形宽 / 高（mm）；矩形须**完整落在页面内**（允许贴边） |
+| `rectangles[].cyan` / `magenta` / `yellow` / `key` | 数值 | 0～1 | 青 / 品红 / 黄 / 黑（key）四通道覆盖率，`1` = 100% |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/ink-zones \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 200,
+    "page_height_mm": 100,
+    "gutter_mm": 0,
+    "duplex_flip": "long",
+    "ink_zone_count": 4,
+    "print_run": 1000,
+    "pages": [
+      {
+        "page": 1,
+        "rectangles": [
+          {"x_mm": 0, "y_mm": 0, "width_mm": 150, "height_mm": 10,
+           "cyan": 0.5, "magenta": 0, "yellow": 0, "key": 0}
+        ]
+      }
+    ]
+  }'
+```
+
+### 映射与拆分规则
+
+- **页位映射**：完全沿用机台版面——页内坐标以页面（阅读方向）左上角为原点：
+  - 正面与 `long`（长边翻转）背面页位旋转 `0°`（`long` 背面按**交换后的槽位**定位），
+    纸面矩形左上角即 `(槽位 x + 页内 x, 页内 y)`；
+  - `short`（短边翻转）背面页位绕自身中心旋转 `180°`，矩形宽高不变、左上角映射为
+    `(槽位 x + 页宽 − x − 宽, 页高 − y − 高)`。
+- **等宽墨区**：沿纸面宽度（`2 × page_width_mm + gutter_mm`）自左向右等分为
+  `ink_zone_count` 个墨区，墨区宽 = 纸面宽 ÷ 墨区数；跨墨区边界的矩形按**与各墨区的
+  交叠面积**拆分（落在中缝内的部分不着墨）。
+- **等效着墨面积**：某墨区某通道的值 =
+  `Σ（矩形与该墨区的交叠面积 mm² × 该通道覆盖率 0～1）× print_run`；
+  四个通道分别累计，同一墨区多个矩形的贡献直接相加。
+- **空白页不计**：末帖补齐的空白页位不着墨；未在 `pages` 中给出的页面（或矩形为空的
+  页面）贡献为 0。
+
+### 响应
+
+按帖号 `signature_index`、张号 `sheet_index`（从 1 开始，1 为最外张）、正反面
+（`front` / `back`）返回；每个面给出**全部墨区**（含着墨为 0 的墨区），墨区自左向右、
+`zone_index` 从 1 开始，并给出墨区左边界 `x_mm` 与 `width_mm`；四通道字段为
+`cyan_area_mm2` / `magenta_area_mm2` / `yellow_area_mm2` / `key_area_mm2`
+（均已乘印数）。顶层回显机台版面参数、`ink_zone_count`、`print_run`、纸面尺寸与
+等宽墨区宽 `zone_width_mm`。
+
+上例（4 页、左装订、纸面 400 × 100、墨区 4、`long`、印数 1000）中，第 1 页位于正面
+右槽（x=200），矩形映射到纸面 `[200, 350] × [0, 10]`：墨区 3（`[200,300)`）交叠
+100 mm、墨区 4（`[300,400)`）交叠 50 mm，青通道结果分别为
+`100 × 10 × 0.5 × 1000 = 500000` 与 `50 × 10 × 0.5 × 1000 = 250000`：
+
+```json
+{
+  "total_pages": 4,
+  "max_sheets_per_signature": 1,
+  "binding": "left",
+  "page_width_mm": 200.0,
+  "page_height_mm": 100.0,
+  "gutter_mm": 0.0,
+  "duplex_flip": "long",
+  "ink_zone_count": 4,
+  "print_run": 1000,
+  "paper_width_mm": 400.0,
+  "paper_height_mm": 100.0,
+  "zone_width_mm": 100.0,
+  "signature_count": 1,
+  "signatures": [
+    {
+      "signature_index": 1,
+      "sheet_count": 1,
+      "page_count_padded": 4,
+      "paper_width_mm": 400.0,
+      "paper_height_mm": 100.0,
+      "sheets": [
+        {
+          "sheet_index": 1,
+          "front": {
+            "zones": [
+              {"zone_index": 1, "x_mm": 0.0,   "width_mm": 100.0,
+               "cyan_area_mm2": 0.0, "magenta_area_mm2": 0.0,
+               "yellow_area_mm2": 0.0, "key_area_mm2": 0.0},
+              {"zone_index": 2, "x_mm": 100.0, "width_mm": 100.0,
+               "cyan_area_mm2": 0.0, "magenta_area_mm2": 0.0,
+               "yellow_area_mm2": 0.0, "key_area_mm2": 0.0},
+              {"zone_index": 3, "x_mm": 200.0, "width_mm": 100.0,
+               "cyan_area_mm2": 500000.0, "magenta_area_mm2": 0.0,
+               "yellow_area_mm2": 0.0, "key_area_mm2": 0.0},
+              {"zone_index": 4, "x_mm": 300.0, "width_mm": 100.0,
+               "cyan_area_mm2": 250000.0, "magenta_area_mm2": 0.0,
+               "yellow_area_mm2": 0.0, "key_area_mm2": 0.0}
+            ]
+          },
+          "back": { "zones": ["…全部墨区均为 0…"] }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 非法参数（4xx）
+
+机台版面参数的校验与 `/api/v1/impose/press-layout` 完全一致；此外 `ink_zone_count`
+不在 1～16、`print_run` 不是正整数、`pages[].page` 无效（小于 1 或超过 `total_pages`）、
+同一页码重复给出、矩形缺字段或含未定义字段、坐标/宽高为非有限值（`NaN` / `Infinity`）、
+宽高非正、**矩形越出页面**（含负坐标，右下角超出页宽 / 页高）、任一通道覆盖率不在
+0～1、**同页矩形内部重叠**（边缘相切不算重叠）时，均返回
+`422 Unprocessable Entity`。`pages` 为空数组是合法请求（所有墨区结果为 0）。
 
 ## 双面拼版校样 PDF（POST /api/v1/impose/proof.pdf）
 
@@ -745,7 +888,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

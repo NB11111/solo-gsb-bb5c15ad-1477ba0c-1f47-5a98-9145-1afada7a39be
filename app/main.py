@@ -13,6 +13,7 @@ from .imposition import (
     impose,
     impose_chapters,
     inspect_observed_sheets,
+    ink_zone_coverage,
     locate_defects,
     plan_reprint,
     press_layout,
@@ -38,9 +39,11 @@ app = FastAPI(
         "支持机台版面：在拼版结果上给出纸面尺寸与正反面各页位的坐标、旋转角。"
         "支持瑕疵定位：把纸面上的瑕疵点（帖号/张号/面/坐标）反查为原稿页码"
         "与阅读方向的页内坐标，中缝与空白页位单独标记。"
+        "支持墨区着墨面积：页内 CMYK 矩形随页位 0°/180° 映射到纸面，"
+        "按等宽墨区拆分，按帖/张/正反面/墨区返回乘印数后的等效着墨面积。"
         "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -259,6 +262,138 @@ class LocateDefectsResponse(BaseModel):
     defects: list[DefectLocation] = Field(
         ..., description="逐点定位结果，按请求 defects 顺序"
     )
+
+
+# ---------------------------------------------------------------------------
+# 墨区着墨面积 /api/v1/impose/ink-zones
+# ---------------------------------------------------------------------------
+
+
+class InkRectangle(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x_mm: float = Field(
+        ..., description="页内矩形左上角 x（mm），以页面（阅读方向）左上角为原点"
+    )
+    y_mm: float = Field(
+        ..., description="页内矩形左上角 y（mm），以页面（阅读方向）左上角为原点"
+    )
+    width_mm: float = Field(..., description="矩形宽度（mm），正数")
+    height_mm: float = Field(..., description="矩形高度（mm），正数")
+    cyan: float = Field(..., ge=0.0, le=1.0, description="青通道覆盖率，0～1")
+    magenta: float = Field(..., ge=0.0, le=1.0, description="品红通道覆盖率，0～1")
+    yellow: float = Field(..., ge=0.0, le=1.0, description="黄通道覆盖率，0～1")
+    key: float = Field(..., ge=0.0, le=1.0, description="黑（key）通道覆盖率，0～1")
+
+    @field_validator("x_mm", "y_mm", "width_mm", "height_mm")
+    @classmethod
+    def validate_finite_mm(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("矩形坐标与宽高必须为有限数值（单位 mm）")
+        return value
+
+
+class PageInk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    page: int = Field(..., ge=1, description="页码，从 1 开始，不能超过总页数")
+    rectangles: list[InkRectangle] = Field(
+        ..., description="该页互不重叠的页内矩形列表（允许为空列表）"
+    )
+
+
+class InkZonesRequest(PressLayoutRequest):
+    """墨区着墨面积请求：机台版面全部参数 + 墨区数、印数与各页矩形。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ink_zone_count: int = Field(
+        ..., ge=1, le=16, description="沿纸面宽度方向的等宽墨区数量，1～16"
+    )
+    print_run: int = Field(..., ge=1, description="印数，正整数")
+    pages: list[PageInk] = Field(
+        ..., description="各页页内矩形及 CMYK 覆盖率（允许为空数组）"
+    )
+
+    @model_validator(mode="after")
+    def validate_ink_pages(self) -> "InkZonesRequest":
+        # 页码越界、矩形越界、同页重叠等业务校验在核心算法内统一完成；
+        # 这里仅做校验，响应结果在端点内重新计算
+        ink_zone_coverage(
+            total_pages=self.total_pages,
+            max_sheets=self.max_sheets_per_signature,
+            binding=self.binding,
+            page_width_mm=self.page_width_mm,
+            page_height_mm=self.page_height_mm,
+            gutter_mm=self.gutter_mm,
+            duplex_flip=self.duplex_flip,
+            ink_zone_count=self.ink_zone_count,
+            print_run=self.print_run,
+            pages=[
+                {
+                    "page": item.page,
+                    "rectangles": [r.model_dump() for r in item.rectangles],
+                }
+                for item in self.pages
+            ],
+        )
+        return self
+
+
+class InkZone(BaseModel):
+    zone_index: int = Field(..., description="墨区序号，从 1 开始（沿纸面宽度自左向右）")
+    x_mm: float = Field(..., description="墨区左边界 x 坐标（mm），以纸面左上角为原点")
+    width_mm: float = Field(..., description="墨区宽度（mm），各区等宽（末区含尾差）")
+    cyan_area_mm2: float = Field(
+        ..., description="青通道等效着墨面积 × 印数（mm²）"
+    )
+    magenta_area_mm2: float = Field(
+        ..., description="品红通道等效着墨面积 × 印数（mm²）"
+    )
+    yellow_area_mm2: float = Field(
+        ..., description="黄通道等效着墨面积 × 印数（mm²）"
+    )
+    key_area_mm2: float = Field(
+        ..., description="黑通道等效着墨面积 × 印数（mm²）"
+    )
+
+
+class InkZoneSide(BaseModel):
+    zones: list[InkZone] = Field(
+        ..., description="该面全部等宽墨区（含着墨为 0 的墨区），自左向右排列"
+    )
+
+
+class InkZoneSheet(BaseModel):
+    sheet_index: int = Field(..., description="帖内纸张序号，从 1 开始（1 为最外张）")
+    front: InkZoneSide = Field(..., description="正面各墨区着墨面积")
+    back: InkZoneSide = Field(..., description="背面各墨区着墨面积")
+
+
+class InkZoneSignature(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_count: int = Field(..., description="本帖纸张数")
+    page_count_padded: int = Field(..., description="本帖补齐空白后的总页数（4 的倍数）")
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    sheets: list[InkZoneSheet] = Field(..., description="帖内纸张，按从外到内排列")
+
+
+class InkZonesResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    ink_zone_count: int = Field(..., description="等宽墨区数量")
+    print_run: int = Field(..., description="印数")
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    zone_width_mm: float = Field(..., description="单个墨区宽度（mm）= 纸面宽 / 墨区数")
+    signature_count: int
+    signatures: list[InkZoneSignature]
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +719,34 @@ def create_locate_defects(request: LocateDefectsRequest) -> LocateDefectsRespons
         ],
     )
     return LocateDefectsResponse(**result)
+
+
+@app.post(
+    "/api/v1/impose/ink-zones",
+    response_model=InkZonesResponse,
+    tags=["拼版"],
+    summary="墨区着墨面积：页内矩形映射纸面并按等宽墨区拆分（乘印数）",
+)
+def create_ink_zones(request: InkZonesRequest) -> InkZonesResponse:
+    result = ink_zone_coverage(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+        ink_zone_count=request.ink_zone_count,
+        print_run=request.print_run,
+        pages=[
+            {
+                "page": item.page,
+                "rectangles": [r.model_dump() for r in item.rectangles],
+            }
+            for item in request.pages
+        ],
+    )
+    return InkZonesResponse(**result)
 
 
 @app.post(
